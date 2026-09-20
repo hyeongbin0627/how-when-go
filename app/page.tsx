@@ -59,11 +59,7 @@ const CITY_MAP: Record<string, { ktx: string; srt: string; bus: string }> = {
 
 /* ─── 유틸 ─── */
 function todayKST() {
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const dt = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${dt}`;
+  return new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10);
 }
 function nowKSTMinutes() {
   const d = new Date();
@@ -71,12 +67,12 @@ function nowKSTMinutes() {
 }
 function dateRange() {
   const days: string[] = [];
-  const base = new Date();
+  const base = new Date(`${todayKST()}T00:00:00Z`);
   for (let i = 0; i < 14; i++) {
-    const d = new Date(base); d.setDate(d.getDate() + i);
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, '0');
-    const dt = String(d.getDate()).padStart(2, '0');
+    const d = new Date(base); d.setUTCDate(d.getUTCDate() + i);
+    const y = d.getUTCFullYear();
+    const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const dt = String(d.getUTCDate()).padStart(2, '0');
     days.push(`${y}-${m}-${dt}`);
   }
   return days;
@@ -97,16 +93,37 @@ function fmtDur(min: number) {
 }
 
 /* ─── 메인 컴포넌트 ─── */
+async function readResponse(response: Response) {
+  const data = await response.json();
+  if (!response.ok || data.error) throw new Error(data.error || '조회 실패');
+  return data;
+}
 export default function Home() {
   const [realTime, setRealTime] = useState(new Date());
+  const clockOffset = useRef(0);
 
   // 마우스 드래그 스크롤 상태
   const transportScroll = useDragScroll();
   const filterScroll = useDragScroll();
 
   useEffect(() => {
-    const timer = setInterval(() => setRealTime(new Date()), 30000);
-    return () => clearInterval(timer);
+    let active = true;
+    const sync = async () => {
+      const start = Date.now();
+      try {
+        const response = await fetch('/api/time', { cache: 'no-store' });
+        const data = await response.json();
+        if (active && Number.isFinite(data.now)) {
+          clockOffset.current = data.now + (Date.now() - start) / 2 - Date.now();
+          setRealTime(new Date(Date.now() + clockOffset.current));
+        }
+      } catch { /* 다음 동기화까지 기기 시간을 사용합니다. */ }
+    };
+    void sync();
+    const timer = setInterval(() => setRealTime(new Date(Date.now() + clockOffset.current)), 1000);
+    const syncTimer = setInterval(sync, 60000);
+    window.addEventListener('focus', sync);
+    return () => { active = false; clearInterval(timer); clearInterval(syncTimer); window.removeEventListener('focus', sync); };
   }, []);
 
   const [mode, setMode] = useState<Mode>('all');
@@ -120,18 +137,25 @@ export default function Home() {
   
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [selected, setSelected] = useState<Item | null>(null);
   const [step, setStep] = useState(0); 
   const [page, setPage] = useState(1);
   const [startHour, setStartHour] = useState(0);
   const [endHour, setEndHour] = useState(24);
   const heading = useRef<HTMLHeadingElement>(null);
+  const requestId = useRef(0);
+  const availableModes = new Set(rawItems.filter(item => new Date(`${date}T${item.dep}:00+09:00`).getTime() > realTime.getTime()).map(item => item.type));
+  useEffect(() => {
+    if (!loading && mode !== 'all' && !availableModes.has(mode)) setMode('all');
+  }, [rawItems, loading, mode, date, realTime]);
 
   // 데이터 로드
   const fetchData = useCallback(async () => {
     if (dep === arr) return;
-
-    setLoading(true); setError(''); setSelected(null); setStep(0);
+    const currentRequest = ++requestId.current;
+    setRawItems([]);
+    setLoading(true); setError(''); setNotice(''); setSelected(null); setStep(0);
     try {
       const d = date.replace(/-/g, '');
       const ktxDep = CITY_MAP[dep].ktx;
@@ -143,19 +167,16 @@ export default function Home() {
       const reqs: Promise<Item[]>[] = [];
 
       // KTX & ITX/무궁화 (코레일 통신)
-      if (['all', 'ktx', 'itx'].includes(mode)) {
+      {
         reqs.push(fetch(`/api/trains?depId=${CITY_MAP[dep].ktx}&arrId=${CITY_MAP[arr].ktx}&date=${dateNum}`)
-          .then(r => r.json())
+          .then(readResponse)
           .then(d => (d.trains || []).filter((t: any) => {
-            if (mode === 'ktx') return t.type === 'ktx';
-            if (mode === 'itx') return t.type === 'itx';
             // mode === 'all'
             const depSrt = CITY_MAP[dep].srt;
             const arrSrt = CITY_MAP[arr].srt;
             const depKtx = CITY_MAP[dep].ktx;
             const arrKtx = CITY_MAP[arr].ktx;
             // 수서역 등 SRT 전용역을 별도로 호출하는 상황이라면, 본 통신(코레일)에서 나온 SRT는 뺌
-            if (depSrt !== depKtx || arrSrt !== arrKtx) return t.type !== 'srt';
             return true;
           }).map((t: any) => ({
             id: `${t.type}-${t.no}`, type: t.type, no: t.no, grade: t.grade,
@@ -166,17 +187,17 @@ export default function Home() {
       }
 
       // SRT (출발지나 도착지의 SRT ID가 KTX ID와 다른 경우, 예: 수서역)
-      if (['all', 'srt'].includes(mode)) {
+      {
         const depSrt = CITY_MAP[dep].srt;
         const arrSrt = CITY_MAP[arr].srt;
         const depKtx = CITY_MAP[dep].ktx;
         const arrKtx = CITY_MAP[arr].ktx;
 
         // 만약 srt 전용 역(수서 등)이 다르다면, SRT API를 따로 한번 더 호출해야 함
-        if (mode === 'srt' || depSrt !== depKtx || arrSrt !== arrKtx) {
+        if (depSrt !== depKtx || arrSrt !== arrKtx) {
           reqs.push(fetch(`/api/trains?depId=${depSrt}&arrId=${arrSrt}&date=${dateNum}`)
-            .then(r => r.json())
-            .then(d => (d.trains || []).filter((t: any) => t.type === 'srt').map((t: any) => ({
+            .then(readResponse)
+            .then(d => (d.trains || []).map((t: any) => ({
               id: `srt-${t.no}`, type: 'srt', no: t.no, grade: t.grade,
               dep: t.dep, arr: t.arr, 
               depStation: t.depStation, arrStation: t.arrStation,
@@ -186,9 +207,9 @@ export default function Home() {
       }
 
       // BUS
-      if (['all', 'bus'].includes(mode)) {
+      {
         reqs.push(fetch(`/api/buses?dep=${CITY_MAP[dep].bus}&arr=${CITY_MAP[arr].bus}&date=${dateNum}`)
-          .then(r => r.json())
+          .then(readResponse)
           .then(d => (d.buses || []).map((b: any, idx: number) => ({
             id: `bus-${b.dep}-${idx}`, type: 'bus', grade: b.grade,
             dep: b.dep, arr: b.arr,
@@ -198,6 +219,9 @@ export default function Home() {
       }
 
       const results = await Promise.allSettled(reqs);
+      if (currentRequest !== requestId.current) return;
+      const failures = results.filter(r => r.status === 'rejected');
+      if (failures.length) setError('일부 교통편을 조회하지 못했습니다. 잠시 후 새로고침해 주세요.');
       let combined: Item[] = [];
       results.forEach(res => {
         if (res.status === 'fulfilled') {
@@ -205,29 +229,30 @@ export default function Home() {
         }
       });
       combined.sort((a, b) => a.dep.localeCompare(b.dep));
+      if (!failures.length && !combined.some(item => item.type !== 'bus')) setNotice('선택한 날짜·구간의 열차 시간표가 제공되지 않았습니다. 운행 여부는 코레일·SRT 공식 사이트에서 확인해 주세요.');
       setRawItems(combined);
     } catch {
       setError('네트워크 오류가 발생했습니다.');
     } finally {
-      setLoading(false);
+      if (currentRequest === requestId.current) setLoading(false);
     }
-  }, [mode, dep, arr, date]);
+  }, [dep, arr, date]);
 
   // 필터 적용 및 뱃지 계산
   useEffect(() => {
-    let result = [...rawItems];
+    let result = rawItems.filter(item => mode === 'all' || item.type === mode).map(item => ({ ...item, statusCode: undefined as BaseItem['statusCode'] }));
     
     // 상태값 계산 (지나간 표만 숨기기, 가짜 예약 상태 제거)
     const isToday = date === todayKST();
-    const currentMins = realTime.getHours() * 60 + realTime.getMinutes();
+    const currentMins = realTime.getTime();
     
     result.forEach(item => {
       const [dh, dm] = item.dep.split(':').map(Number);
-      const depMins = dh * 60 + dm;
-      if (isToday) {
-        if (depMins < currentMins) {
+      const depMins = new Date(`${date}T${item.dep}:00+09:00`).getTime();
+      {
+        if (depMins <= currentMins) {
           item.statusCode = 'ended';
-        } else if (depMins - currentMins <= 15) {
+        } else if (depMins - currentMins <= 15 * 60000) {
           item.statusCode = 'urgent';
         }
       }
@@ -271,20 +296,22 @@ export default function Home() {
 
       // 탭에 따른 필터 적용
       if (filter === 'cheap') result = result.filter(item => item.charge === minPrice);
-      if (filter === 'fast') result = result.filter(item => diffMin(item.dep, item.arr) === minDur);
+      if (filter === 'fast') result = result.filter(item => item.isFastest);
       if (filter === 'expensive') result = result.filter(item => item.charge === maxPrice);
-      if (filter === 'slow') result = result.filter(item => diffMin(item.dep, item.arr) === maxDur);
+      if (filter === 'slow') result = result.filter(item => item.isSlowest);
     }
-    setPage(1);
     setItems(result);
-  }, [rawItems, filter, date, realTime, startHour, endHour]);
+    setPage(p => Math.min(p, Math.max(1, Math.ceil(result.length / 10))));
+    if (selected && new Date(`${date}T${selected.dep}:00+09:00`).getTime() <= realTime.getTime()) { setSelected(null); setStep(0); }
+  }, [rawItems, mode, filter, date, realTime, startHour, endHour, selected]);
+  useEffect(() => { setPage(1); setSelected(null); }, [mode, filter, date, startHour, endHour]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
   useEffect(() => { heading.current?.focus(); }, [step]);
 
   const bookingUrl = selected?.type === 'srt'
     ? 'https://etk.srail.kr/'
-    : selected?.type === 'ktx'
+    : selected?.type === 'ktx' || selected?.type === 'itx'
     ? 'https://www.letskorail.com/'
     : 'https://www.kobus.co.kr/';
 
@@ -351,20 +378,20 @@ export default function Home() {
                   aria-label="교통수단 메인 선택"
                 >
                   <button className={`tab-all ${mode === 'all' ? 'chosen' : ''}`} onClick={() => setMode('all')}>
-                    ✨ 통합 추천
+                    전체
                   </button>
-                  <button className={mode === 'ktx' ? 'chosen' : ''} onClick={() => setMode('ktx')}>
+                  {availableModes.has('ktx') && <button className={mode === 'ktx' ? 'chosen' : ''} onClick={() => setMode('ktx')}>
                     <TrainFront size={16} /> KTX
-                  </button>
-                  <button className={mode === 'srt' ? 'chosen' : ''} onClick={() => setMode('srt')}>
+                  </button>}
+                  {availableModes.has('srt') && <button className={mode === 'srt' ? 'chosen' : ''} onClick={() => setMode('srt')}>
                     <TrainFront size={16} /> SRT
-                  </button>
-                  <button className={mode === 'itx' ? 'chosen' : ''} onClick={() => setMode('itx')}>
+                  </button>}
+                  {availableModes.has('itx') && <button className={mode === 'itx' ? 'chosen' : ''} onClick={() => setMode('itx')}>
                     <TramFront size={16} /> 일반열차
-                  </button>
-                  <button className={mode === 'bus' ? 'chosen' : ''} onClick={() => setMode('bus')}>
+                  </button>}
+                  {availableModes.has('bus') && <button className={mode === 'bus' ? 'chosen' : ''} onClick={() => setMode('bus')}>
                     <BusFront size={16} /> 고속버스
-                  </button>
+                  </button>}
                 </div>
 
                 {/* 서브 필터 */}
@@ -455,6 +482,7 @@ export default function Home() {
                   </h3>
                   <span>{loading ? '조회 중…' : `${items.length}편`}</span>
                 </div>
+                {!loading && notice && <p className="hint" role="status">{notice}</p>}
 
                 {(() => {
                   const PAGE_SIZE = 10;
@@ -500,9 +528,10 @@ export default function Home() {
                               {item.type === 'bus' ? <BusFront size={12}/> : item.type === 'itx' ? <TramFront size={12}/> : <TrainFront size={12}/>}
                               {' '}
                               {item.type === 'bus' 
-                                ? `${(item as BusItem).grade}고속` 
+                                ? `고속버스 · ${(item as BusItem).grade}` 
                                 : `${(item as TrainItem).grade || item.type.toUpperCase()} · 열차 ${(item as TrainItem).no}`}
                               <span>·</span>{fmtDur(dur)}
+                              <span>· {item.depStation} → {item.arrStation}</span>
                             </span>
                             {(item.isFastest || item.isCheapest || item.isSlowest || item.isMostExpensive) && (
                               <div className="badges">

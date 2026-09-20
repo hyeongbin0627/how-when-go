@@ -14,10 +14,23 @@ export async function GET(req: Request) {
     `&numOfRows=1000&pageNo=1&_type=json&depPlaceId=${depId}&arrPlaceId=${arrId}&depPlandTime=${date}`;
 
   try {
-    const res = await fetch(url, { next: { revalidate: 300 } }); // 5분 캐시
-    const data = await res.json();
-    const raw: any[] = data?.response?.body?.items?.item ?? [];
-    const items = Array.isArray(raw) ? raw : [raw];
+    if (!KEY) throw new Error('Missing key');
+    const stations: Record<string, string[]> = { NAT010000: ['NAT010000', 'NAT010032'], NAT011668: ['NAT011668', 'NAT030057'], NAT031857: ['NAT031857', 'NAT883012'] };
+    const items = (await Promise.all((stations[depId] ?? [depId]).flatMap(dep => (stations[arrId] ?? [arrId]).map(async arr => {
+      const rows: any[] = [];
+      for (let page = 1; page <= 50; page++) {
+        const query = new URLSearchParams({serviceKey: decodeURIComponent(KEY.trim()), numOfRows: '100', pageNo: String(page), _type: 'json', depPlaceId: dep, arrPlaceId: arr, depPlandTime: date});
+        const res = await fetch(`${BASE}/GetStrtpntAlocFndTrainInfo?${query}`, {next: {revalidate: 300}, signal: AbortSignal.timeout(20000)});
+        if (!res.ok) throw new Error('Upstream error');
+        const data = await res.json();
+        if (String(data.response?.header?.resultCode) !== '00') throw new Error('API error');
+        const raw = data.response?.body?.items?.item;
+        const chunk = Array.isArray(raw) ? raw : raw && typeof raw === 'object' ? [raw] : [];
+        rows.push(...chunk);
+        if (!chunk.length || rows.length >= Number(data.response.body.totalCount)) return rows;
+      }
+      throw new Error('Incomplete timetable');
+    })))).flat();
 
     // 출발시간 순 정렬 및 포맷팅
     const trains = items
@@ -26,17 +39,17 @@ export async function GET(req: Request) {
         const no = String(t.trainno).replace(/^0+/, ''); // 앞의 0 제거 (00301 -> 301)
         
         // SRT 판별: 수서발이거나, 열차번호가 300번대이거나 4000번대(SRT 임시/추가)인 경우
-        const isSrt = t.depplacename === '수서' || t.arrplacename === '수서' || 
-                      (parseInt(no) >= 300 && parseInt(no) <= 399) || 
-                      (parseInt(no) >= 4000 && parseInt(no) <= 4999 && !t.traingradename.includes('ITX'));
+        const isSrt = t.depplacename === '수서' || t.arrplacename === '수서' || /SRT/i.test(String(t.traingradename));
 
         let type = 'ktx';
-        let grade = t.traingradename;
+        let grade = String(t.traingradename ?? '일반열차');
+        t.depplandtime = String(t.depplandtime);
+        t.arrplandtime = String(t.arrplandtime);
         
         if (isSrt) {
           type = 'srt';
           grade = 'SRT';
-        } else if (grade.includes('무궁화') || grade.includes('ITX') || grade.includes('새마을')) {
+        } else if (!grade.includes('KTX')) {
           type = 'itx';
         }
 
@@ -55,8 +68,9 @@ export async function GET(req: Request) {
       })
       .sort((a, b) => a.depFull.localeCompare(b.depFull));
 
-    return NextResponse.json({ trains, date });
+    const unique = [...new Map(trains.slice().reverse().map(t => [`${t.type}-${t.no}`, t])).values()].sort((a,b) => a.depFull.localeCompare(b.depFull));
+    return NextResponse.json({ trains: unique, date });
   } catch (e) {
-    return NextResponse.json({ error: '열차 정보를 불러오지 못했습니다.', detail: String(e) }, { status: 500 });
+    return NextResponse.json({ error: '열차 정보를 불러오지 못했습니다. 잠시 후 다시 조회해 주세요.' }, { status: 502 });
   }
 }
