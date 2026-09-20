@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 
 const BASE = 'https://apis.data.go.kr/1613000/TrainInfo';
-const KEY = process.env.KORAIL_API_KEY!; // KORAIL_API_KEY is actually the same data.go.kr key
+const KEY = process.env.KORAIL_API_KEY || 'da6f0998b164e339129ffb91c304cbfdd8ea1b4e12fc2e38e0ff3a46a331ae78';
 
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);

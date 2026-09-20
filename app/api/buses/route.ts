@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 
 const BASE = 'https://apis.data.go.kr/1613000/ExpBusInfo';
-const KEY = process.env.KORAIL_API_KEY!; // 같은 키 사용
+const KEY = process.env.KORAIL_API_KEY || 'da6f0998b164e339129ffb91c304cbfdd8ea1b4e12fc2e38e0ff3a46a331ae78'; // 같은 키 사용
 
 // 터미널 코드 맵 (테스트로 확인한 값)
 const TERMINALS: Record<string, { id: string; label: string }> = {
